@@ -22,6 +22,7 @@ import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.ColumnarBatch;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.internal.actions.AddFile;
+import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.RemoveFile;
 import io.delta.kernel.internal.data.StructRow;
 import io.delta.kernel.utils.CloseableIterator;
@@ -113,6 +114,17 @@ public class StreamingHelper {
 
     RemoveFile removeFile = new RemoveFile(removeFileRow);
     return removeFile.getDataChange() ? Optional.of(removeFile) : Optional.empty();
+  }
+
+  /**
+   * Get Metadata action from a batch at the specified row, if present.
+   */
+  public static Optional<Metadata> getMetadata(ColumnarBatch batch, int rowId) {
+    int metadataIdx = getFieldIndex(batch, "metaData");
+    ColumnVector metadataVector = batch.getColumnVector(metadataIdx);
+    Metadata metadata = Metadata.fromColumnVector(metadataVector, rowId);
+
+    return Optional.ofNullable(metadata);
   }
 
   /** Private constructor to prevent instantiation of this utility class. */

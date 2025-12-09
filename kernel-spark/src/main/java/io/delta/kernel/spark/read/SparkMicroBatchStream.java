@@ -24,29 +24,45 @@ import io.delta.kernel.exceptions.UnsupportedTableFeatureException;
 import io.delta.kernel.internal.DeltaLogActionUtils.DeltaAction;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.AddFile;
+import io.delta.kernel.internal.actions.Metadata;
+import io.delta.kernel.internal.actions.Protocol;
 import io.delta.kernel.internal.actions.RemoveFile;
+import io.delta.kernel.internal.types.TypeWideningChecker;
+import io.delta.kernel.internal.util.ColumnMapping;
+import io.delta.kernel.internal.util.Preconditions;
 import io.delta.kernel.internal.util.Utils;
+import io.delta.kernel.internal.util.VectorUtils;
 import io.delta.kernel.spark.snapshot.DeltaSnapshotManager;
 import io.delta.kernel.spark.utils.ScalaUtils;
+import io.delta.kernel.spark.utils.SchemaUtils;
 import io.delta.kernel.spark.utils.StreamingHelper;
+import io.delta.kernel.types.StructType;
 import io.delta.kernel.utils.CloseableIterator;
 import java.io.IOException;
 import java.util.*;
+import java.util.stream.Collectors;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.streaming.*;
-import org.apache.spark.sql.delta.DeltaErrors;
-import org.apache.spark.sql.delta.DeltaOptions;
-import org.apache.spark.sql.delta.DeltaStartingVersion;
-import org.apache.spark.sql.delta.StartingVersion;
-import org.apache.spark.sql.delta.StartingVersionLatest$;
+import org.apache.spark.sql.delta.*;
 import org.apache.spark.sql.delta.sources.DeltaSQLConf;
 import org.apache.spark.sql.delta.sources.DeltaSource;
 import org.apache.spark.sql.delta.sources.DeltaSourceOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Option;
+import scala.collection.immutable.List;
+import scala.collection.immutable.List$;
+import scala.collection.immutable.Seq;
+import scala.collection.immutable.Seq$;
+import scala.collection.JavaConverters;
+import scala.jdk.javaapi.CollectionConverters;
+
+import static io.delta.kernel.internal.tablefeatures.TableFeatures.TYPE_WIDENING_RW_FEATURE;
+import static io.delta.kernel.internal.tablefeatures.TableFeatures.TYPE_WIDENING_RW_PREVIEW_FEATURE;
 
 public class SparkMicroBatchStream
     implements MicroBatchStream, SupportsAdmissionControl, SupportsTriggerAvailableNow {
@@ -63,9 +79,50 @@ public class SparkMicroBatchStream
   private final String tableId;
   private final boolean shouldValidateOffsets;
   private final SparkSession spark;
+  private final Snapshot snapshotAtSourceInit;
+  private final Metadata metadataAtSourceInit;
 
   // Tracks whether this is the initial batch for this stream (no checkpointed offset).
   private boolean isInitialBatch = false;
+
+  /**
+   * Flag that allows user to force enable unsafe streaming read on Delta table with
+   * column mapping enabled AND drop/rename actions.
+   */
+  protected final boolean allowUnsafeStreamingReadOnColumnMappingSchemaChanges;
+
+  protected final boolean allowUnsafeStreamingReadOnPartitionColumnChanges;
+
+  /**
+   * Flag that allows user to disable the read-compatibility check during stream start which
+   * protects against a corner case in which verifyStreamHygiene could not detect.
+   * This is a bug fix but yet a potential behavior change, so we add a flag to fallback.
+   */
+  protected final boolean forceEnableStreamingReadOnReadIncompatibleSchemaChangesDuringStreamStart;
+
+  /**
+   * Flag that allow user to fall back to the legacy behavior in which user can allow nullable=false
+   * schema to read nullable=true data, which is incorrect but a behavior change regardless.
+   */
+  protected final boolean forceEnableUnsafeReadOnNullabilityChange;
+
+  /**
+   * Whether we are streaming from a table with column mapping enabled
+   */
+  protected final boolean isStreamingFromColumnMappingTable;
+
+  /**
+   * Whether we are streaming from a table that has the type widening table feature enabled.
+   */
+  protected final boolean typeWideningEnabled;
+
+  /**
+   * Whether we should track widening type changes to allow users to accept them and resume
+   * stream processing.
+   */
+  protected final boolean enableSchemaTrackingForTypeWidening;
+
+  protected final StructType readSchemaAtSourceInit;
 
   public SparkMicroBatchStream(DeltaSnapshotManager snapshotManager, Configuration hadoopConf) {
     this(
@@ -88,11 +145,36 @@ public class SparkMicroBatchStream
     this.options = options;
 
     // Initialize snapshot at source init to get table ID, similar to DeltaSource.scala
-    Snapshot snapshotAtSourceInit = snapshotManager.loadLatestSnapshot();
-    this.tableId = ((SnapshotImpl) snapshotAtSourceInit).getMetadata().getId();
+    this.snapshotAtSourceInit = snapshotManager.loadLatestSnapshot();
+    SnapshotImpl snapshotImplAtSourceInit = (SnapshotImpl) snapshotAtSourceInit;
+    Protocol protocolAtSourceInit = snapshotImplAtSourceInit.getProtocol();
+    this.metadataAtSourceInit = snapshotImplAtSourceInit.getMetadata();
+    this.tableId = metadataAtSourceInit.getId();
 
     this.shouldValidateOffsets =
         (Boolean) spark.sessionState().conf().getConf(DeltaSQLConf.STREAMING_OFFSET_VALIDATION());
+
+    this.allowUnsafeStreamingReadOnColumnMappingSchemaChanges =
+        (Boolean) spark.sessionState().conf().getConf(DeltaSQLConf
+            .DELTA_STREAMING_UNSAFE_READ_ON_INCOMPATIBLE_COLUMN_MAPPING_SCHEMA_CHANGES());
+    this.allowUnsafeStreamingReadOnPartitionColumnChanges = (Boolean) spark.sessionState().conf()
+        .getConf(DeltaSQLConf.DELTA_STREAMING_UNSAFE_READ_ON_PARTITION_COLUMN_CHANGE());
+    this.forceEnableStreamingReadOnReadIncompatibleSchemaChangesDuringStreamStart =
+        (Boolean) spark.sessionState().conf().getConf(DeltaSQLConf
+                .DELTA_STREAMING_UNSAFE_READ_ON_INCOMPATIBLE_SCHEMA_CHANGES_DURING_STREAM_START());
+    this.forceEnableUnsafeReadOnNullabilityChange = (Boolean) spark.sessionState().conf()
+            .getConf(DeltaSQLConf.DELTA_STREAM_UNSAFE_READ_ON_NULLABILITY_CHANGE());
+    this.isStreamingFromColumnMappingTable = ColumnMapping.getColumnMappingMode(
+        metadataAtSourceInit.getConfiguration()) != ColumnMapping.ColumnMappingMode.NONE;
+    this.typeWideningEnabled = (Boolean) spark.sessionState().conf()
+        .getConf(DeltaSQLConf.DELTA_ALLOW_TYPE_WIDENING_STREAMING_SOURCE()) &&
+            (protocolAtSourceInit.supportsFeature(TYPE_WIDENING_RW_PREVIEW_FEATURE) ||
+            protocolAtSourceInit.supportsFeature(TYPE_WIDENING_RW_FEATURE));
+    this.enableSchemaTrackingForTypeWidening =
+        (Boolean) spark.sessionState().conf()
+            .getConf(DeltaSQLConf.DELTA_TYPE_WIDENING_ENABLE_STREAMING_SCHEMA_TRACKING());
+    // TODO: Schema tracking
+    this.readSchemaAtSourceInit = metadataAtSourceInit.getSchema();
   }
 
   /**
@@ -500,7 +582,7 @@ public class SparkMicroBatchStream
         // TODO(#5318): migrate to kernel's commit-level iterator (WIP).
         // The current one-pass algorithm assumes REMOVE actions proceed ADD actions
         // in a commit; we should implement a proper two-pass approach once kernel API is ready.
-        validateCommit(batch, version, tablePath, endOffset);
+        validateCommit(batch, version, startVersion, tablePath, endOffset);
 
         currentVersion = version;
         currentIndex =
@@ -552,6 +634,7 @@ public class SparkMicroBatchStream
   private void validateCommit(
       ColumnarBatch batch,
       long version,
+      long startVersion,
       String tablePath,
       Optional<DeltaSourceOffset> endOffsetOpt) {
     // If endOffset is at the beginning of this version, exit early.
@@ -565,18 +648,155 @@ public class SparkMicroBatchStream
     int numRows = batch.getSize();
     // TODO(#5319): Implement ignoreChanges & skipChangeCommits & ignoreDeletes (legacy)
     // TODO(#5318): validate METADATA actions
+    Metadata metadataAction = null;
     for (int rowId = 0; rowId < numRows; rowId++) {
       // RULE 1: If commit has RemoveFile(dataChange=true), fail this stream.
       Optional<RemoveFile> removeOpt = StreamingHelper.getDataChangeRemove(batch, rowId);
       if (removeOpt.isPresent()) {
         RemoveFile removeFile = removeOpt.get();
-        Throwable error =
+        throw (RuntimeException)
             DeltaErrors.deltaSourceIgnoreDeleteError(version, removeFile.getPath(), tablePath);
-        if (error instanceof RuntimeException) {
-          throw (RuntimeException) error;
-        } else {
-          throw new RuntimeException(error);
-        }
+      }
+
+      // RULE 2: If commit has Metadata, check read-incompatible schema changes.
+      Optional<Metadata> metadataOpt = StreamingHelper.getMetadata(batch, rowId);
+      if (metadataOpt.isPresent()) {
+        Metadata metadata = metadataOpt.get();
+        checkReadIncompatibleSchemaChanges(metadata, version, startVersion, false);
+        Preconditions.checkArgument(metadataAction == null, "Should not encounter two metadata actions in the same commit");
+        metadataAction = metadata;
+      }
+    }
+  }
+
+  protected void checkReadIncompatibleSchemaChanges(
+      Metadata metadata,
+      long version,
+      long startVersion,
+      boolean validatedDuringStreamStart) {
+    Metadata newMetadata, oldMetadata;
+    if (version < snapshotAtSourceInit.getVersion()) {
+      newMetadata = metadataAtSourceInit;
+      oldMetadata = metadata;
+    } else {
+      newMetadata = metadata;
+      oldMetadata = metadataAtSourceInit;
+    }
+
+    // Table ID has changed during streaming
+    if (!Objects.equals(newMetadata.getId(), oldMetadata.getId())) {
+      throw (RuntimeException)
+          DeltaErrors.differentDeltaTableReadByStreamingSource(newMetadata.getId(), oldMetadata.getId());
+    }
+
+    org.apache.spark.sql.types.StructType newKernelSchema =
+        SchemaUtils.convertKernelSchemaToSparkSchema(newMetadata.getSchema());
+    org.apache.spark.sql.types.StructType oldKernelSchema =
+        SchemaUtils.convertKernelSchemaToSparkSchema(oldMetadata.getSchema());
+    boolean shouldTrackSchema;
+    if (typeWideningEnabled && enableSchemaTrackingForTypeWidening &&
+        TypeWidening.containsWideningTypeChanges(oldKernelSchema, newKernelSchema)) {
+      // If schema tracking is enabled for type widening, we will detect widening type changes and
+      // block the stream until the user sets `allowSourceColumnTypeChange` - similar to handling
+      // DROP/RENAME for column mapping.
+      shouldTrackSchema = true;
+    } else if (allowUnsafeStreamingReadOnColumnMappingSchemaChanges) {
+      shouldTrackSchema = false;
+    } else {
+      // TODO: Column mapping schema changes
+      shouldTrackSchema = true;
+    }
+
+    if (shouldTrackSchema) {
+      throw (RuntimeException) DeltaErrors.blockStreamingReadsWithIncompatibleNonAdditiveSchemaChanges(
+          spark,
+          SchemaUtils.convertKernelSchemaToSparkSchema(oldMetadata.getSchema()),
+          SchemaUtils.convertKernelSchemaToSparkSchema(newMetadata.getSchema()),
+          !validatedDuringStreamStart);
+    }
+
+    // Other standard read compatibility changes
+    if (!validatedDuringStreamStart ||
+        !forceEnableStreamingReadOnReadIncompatibleSchemaChangesDuringStreamStart) {
+
+      // TODO: CDC support
+      StructType schemaChange = metadata.getSchema();
+      org.apache.spark.sql.types.StructType sparkSchemaChange =
+          SchemaUtils.convertKernelSchemaToSparkSchema(schemaChange);
+      org.apache.spark.sql.types.StructType readSparkSchemaAtSourceInit =
+          SchemaUtils.convertKernelSchemaToSparkSchema(readSchemaAtSourceInit);
+
+      // There is a schema change. All the files after this commit will use `schemaChange`. Hence,
+      // we check whether we can use `schema` (the fixed source schema we use in the same run of the
+      // query) to read these new files safely.
+      boolean backfilling = version < snapshotAtSourceInit.getVersion();
+      // We forbid the case when the schemaChange is nullable while the read schema is NOT
+      // nullable, or in other words, `schema` should not tighten nullability from `schemaChange`,
+      // because we don't ever want to read back any nulls when the read schema is non-nullable.
+      boolean shouldForbidTightenNullability = !forceEnableUnsafeReadOnNullabilityChange;
+      // If schema tracking is disabled for type widening, we allow widening type changes to go
+      // through without requiring the user to set `allowSourceColumnTypeChange`. The schema change
+      // will cause the stream to fail with a retryable exception, and the stream will restart using
+      // the new schema.
+      TypeWideningMode typeWideningMode =
+          typeWideningEnabled && !enableSchemaTrackingForTypeWidening
+              ? TypeWideningMode.AllTypeWidening$.MODULE$
+              : TypeWideningMode.NoTypeWidening$.MODULE$;
+      boolean allowTypeWidening = typeWideningEnabled && !enableSchemaTrackingForTypeWidening;
+      Seq<String> newPartitionColumnsSeq = CollectionConverters.asScala(
+          VectorUtils.toJavaList(newMetadata.getPartitionColumns()).stream()
+              .map(Object::toString)
+              .collect(Collectors.toList())
+      ).toSeq();
+      Seq<String> oldPartitionColumnsSeq = CollectionConverters.asScala(
+          VectorUtils.toJavaList(oldMetadata.getPartitionColumns()).stream()
+              .map(Object::toString)
+              .collect(Collectors.toList())
+      ).toSeq();
+
+      if (org.apache.spark.sql.delta.schema.SchemaUtils.isReadCompatible(
+          sparkSchemaChange, readSparkSchemaAtSourceInit,
+          shouldForbidTightenNullability,
+          // If a user is streaming from a column mapping table and enable the unsafe flag to ignore
+          // column mapping schema changes, we can allow the standard check to allow missing columns
+          // from the read schema in the schema change, because the only case that happens is when
+          // user rename/drops column, but they don't care so they enabled the flag to unblock.
+          // This is only allowed when we are "backfilling", i.e. the stream progress is older than
+          // the analyzed table version. Any schema change past the analysis should still throw
+          // exception, because additive schema changes MUST be taken into account.
+          isStreamingFromColumnMappingTable &&
+              allowUnsafeStreamingReadOnColumnMappingSchemaChanges &&
+              backfilling,
+          typeWideningMode,
+          allowUnsafeStreamingReadOnPartitionColumnChanges
+              ? (Seq<String>) Seq$.MODULE$.empty() : newPartitionColumnsSeq,
+          allowUnsafeStreamingReadOnPartitionColumnChanges
+              ? (Seq<String>) Seq$.MODULE$.empty() : oldPartitionColumnsSeq
+      )) {
+        // Only schema change later than the current read snapshot/schema can be retried, in other
+        // words, backfills could never be retryable, because we have no way to refresh
+        // the latest schema to "catch up" when the schema change happens before than current read
+        // schema version.
+        // If not backfilling, we do another check to determine retryability, in which we assume
+        // we will be reading using this later `schemaChange` back on the current outdated `schema`,
+        // and if it works (including that `schemaChange` should not tighten the nullability
+        // constraint from `schema`), it is a retryable exception.
+        boolean retryable = !backfilling && org.apache.spark.sql.delta.schema.SchemaUtils.isReadCompatible(
+            readSparkSchemaAtSourceInit,
+            sparkSchemaChange,
+            shouldForbidTightenNullability,
+            false,
+            typeWideningMode,
+            (Seq<String>) Seq$.MODULE$.empty(),
+            (Seq<String>) Seq$.MODULE$.empty()
+        );
+        throw (RuntimeException) DeltaErrors.schemaChangedException(
+            readSparkSchemaAtSourceInit,
+            sparkSchemaChange,
+            retryable,
+            Option.apply(version),
+            options.containsStartingVersionOrTimestamp()
+        );
       }
     }
   }
